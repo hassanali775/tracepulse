@@ -3,26 +3,8 @@ package domain
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"regexp"
 	"strings"
 	"sync"
-)
-
-// Precompiled once at package init. These run on every ingested error-level
-// event, so compiling per-call would turn signature hashing into the
-// pipeline's hottest allocation source.
-var (
-	reUUID       = regexp.MustCompile(`(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
-	reHexAddr    = regexp.MustCompile(`0x[0-9a-fA-F]+`)
-	reIPv4       = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?\b`)
-	reNumber     = regexp.MustCompile(`\d+`)
-	reQuoted     = regexp.MustCompile(`"[^"]*"|'[^']*'`)
-	reWhitespace = regexp.MustCompile(`\s+`)
-
-	// Strips trailing "file.go:123" line numbers and "+0x1a2b" program
-	// counter offsets from stack frames, leaving the function/symbol name
-	// as the stable part of the frame.
-	reFrameLine = regexp.MustCompile(`:\d+(\s*\+0x[0-9a-fA-F]+)?\s*$`)
 )
 
 // builderPool reuses strings.Builder instances across Compute calls to keep
@@ -77,7 +59,7 @@ func (h *Hasher) Compute(ne *NormalizedEvent) (Signature, error) {
 
 	b.WriteString(ne.Service)
 	b.WriteByte('|')
-	b.WriteString(normalizeMessage(ne.Message))
+	appendNormalizedMessage(b, ne.Message)
 
 	frames := ne.StackFrames
 	if len(frames) > maxFrames {
@@ -85,7 +67,7 @@ func (h *Hasher) Compute(ne *NormalizedEvent) (Signature, error) {
 	}
 	for _, f := range frames {
 		b.WriteByte('\n')
-		b.WriteString(normalizeFrame(f))
+		appendNormalizedFrame(b, f)
 	}
 
 	template := b.String()
@@ -100,24 +82,237 @@ func (h *Hasher) Compute(ne *NormalizedEvent) (Signature, error) {
 }
 
 // normalizeMessage strips high-cardinality, run-specific tokens (UUIDs,
-// hex addresses, IPs, bare numbers, quoted literals) from a message so
-// that structurally identical errors differing only in their dynamic
-// values collapse to the same template.
+// hex addresses, IPs, bare numbers, quoted literals) from a message using
+// a single-pass byte scanner (zero regex) so that structurally identical
+// errors collapse to the same template with zero allocations.
 func normalizeMessage(msg string) string {
-	s := reUUID.ReplaceAllString(msg, "<uuid>")
-	s = reHexAddr.ReplaceAllString(s, "<hex>")
-	s = reIPv4.ReplaceAllString(s, "<ip>")
-	s = reQuoted.ReplaceAllString(s, "<str>")
-	s = reNumber.ReplaceAllString(s, "<n>")
-	s = reWhitespace.ReplaceAllString(s, " ")
-	return strings.TrimSpace(s)
+	var b strings.Builder
+	appendNormalizedMessage(&b, msg)
+	return b.String()
 }
 
-// normalizeFrame strips the line-number/PC-offset suffix from a stack
-// frame, keeping the function/file symbol stable across builds where line
-// numbers shift but the call site does not.
+func appendNormalizedMessage(b *strings.Builder, msg string) {
+	pendingSpace := false
+	writtenAny := false
+	var prevByte byte
+
+	for i := 0; i < len(msg); {
+		ch := msg[i]
+
+		if isSpace(ch) {
+			if writtenAny {
+				pendingSpace = true
+			}
+			i++
+			continue
+		}
+
+		if pendingSpace {
+			b.WriteByte(' ')
+			pendingSpace = false
+			prevByte = ' '
+		}
+
+		// 1. Quoted literal: "..." or '...'
+		if ch == '"' || ch == '\'' {
+			q := ch
+			end := -1
+			for j := i + 1; j < len(msg); j++ {
+				if msg[j] == q {
+					end = j
+					break
+				}
+			}
+			if end != -1 {
+				b.WriteString("<str>")
+				i = end + 1
+				writtenAny = true
+				prevByte = '>'
+				continue
+			}
+		}
+
+		// 2. Hex address: 0x...
+		if n := matchHexAddr(msg[i:]); n > 0 {
+			b.WriteString("<hex>")
+			i += n
+			writtenAny = true
+			prevByte = '>'
+			continue
+		}
+
+		// 3. UUID: 8-4-4-4-12
+		if isUUID(msg[i:]) {
+			b.WriteString("<uuid>")
+			i += 36
+			writtenAny = true
+			prevByte = '>'
+			continue
+		}
+
+		// 4. IPv4 with optional port
+		if n := matchIPv4(msg[i:], prevByte, !writtenAny); n > 0 {
+			b.WriteString("<ip>")
+			i += n
+			writtenAny = true
+			prevByte = '>'
+			continue
+		}
+
+		// 5. Numbers: \d+
+		if isDigit(ch) {
+			for i < len(msg) && isDigit(msg[i]) {
+				i++
+			}
+			b.WriteString("<n>")
+			writtenAny = true
+			prevByte = '>'
+			continue
+		}
+
+		// 6. Default byte
+		b.WriteByte(ch)
+		writtenAny = true
+		prevByte = ch
+		i++
+	}
+}
+
+// normalizeFrame strips line-number/PC-offset suffixes and hex addresses
+// from a stack frame string using hand-rolled byte scanning.
 func normalizeFrame(frame string) string {
-	s := reFrameLine.ReplaceAllString(strings.TrimSpace(frame), "")
-	s = reHexAddr.ReplaceAllString(s, "<hex>")
-	return s
+	var b strings.Builder
+	appendNormalizedFrame(&b, frame)
+	return b.String()
+}
+
+func appendNormalizedFrame(b *strings.Builder, frame string) {
+	s := strings.TrimSpace(frame)
+
+	// Strip +0x... PC offset suffix if present
+	if idx := strings.LastIndex(s, "+0x"); idx != -1 || strings.LastIndex(s, "+0X") != -1 {
+		plusIdx := strings.LastIndex(s, "+")
+		if plusIdx != -1 {
+			valid := true
+			for j := plusIdx + 3; j < len(s); j++ {
+				if !isHexDigit(s[j]) && !isSpace(s[j]) {
+					valid = false
+					break
+				}
+			}
+			if valid {
+				s = strings.TrimSpace(s[:plusIdx])
+			}
+		}
+	}
+
+	// Strip :line_number suffix if present
+	if colonIdx := strings.LastIndex(s, ":"); colonIdx != -1 && colonIdx < len(s)-1 {
+		allDigits := true
+		for j := colonIdx + 1; j < len(s); j++ {
+			if !isDigit(s[j]) {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			s = s[:colonIdx]
+		}
+	}
+
+	s = strings.TrimSpace(s)
+
+	// Replace any 0x... in frame with <hex>
+	for i := 0; i < len(s); {
+		if n := matchHexAddr(s[i:]); n > 0 {
+			b.WriteString("<hex>")
+			i += n
+		} else {
+			b.WriteByte(s[i])
+			i++
+		}
+	}
+}
+
+func isDigit(c byte) bool {
+	return c >= '0' && c <= '9'
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+func isSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
+}
+
+func isWordByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+func matchHexAddr(s string) int {
+	if len(s) < 3 || s[0] != '0' || (s[1] != 'x' && s[1] != 'X') || !isHexDigit(s[2]) {
+		return 0
+	}
+	n := 2
+	for n < len(s) && isHexDigit(s[n]) {
+		n++
+	}
+	return n
+}
+
+func isUUID(s string) bool {
+	if len(s) < 36 {
+		return false
+	}
+	if s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
+		return false
+	}
+	for i := 0; i < 36; i++ {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			continue
+		}
+		if !isHexDigit(s[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func matchIPv4(s string, prevByte byte, isStart bool) int {
+	if !isStart && isWordByte(prevByte) {
+		return 0
+	}
+	idx := 0
+	for octet := 0; octet < 4; octet++ {
+		if octet > 0 {
+			if idx >= len(s) || s[idx] != '.' {
+				return 0
+			}
+			idx++
+		}
+		startNum := idx
+		num := 0
+		for idx < len(s) && isDigit(s[idx]) && idx-startNum < 3 {
+			num = num*10 + int(s[idx]-'0')
+			idx++
+		}
+		if idx == startNum || num > 255 {
+			return 0
+		}
+	}
+	if idx < len(s) && s[idx] == ':' {
+		portStart := idx + 1
+		portIdx := portStart
+		for portIdx < len(s) && isDigit(s[portIdx]) {
+			portIdx++
+		}
+		if portIdx > portStart {
+			idx = portIdx
+		}
+	}
+	if idx < len(s) && isWordByte(s[idx]) {
+		return 0
+	}
+	return idx
 }

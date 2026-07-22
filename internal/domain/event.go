@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // SourceType identifies which streaming parser produced an event. Kept as a
 // distinct string type (not an int enum) so DLQ records and API responses
@@ -201,4 +204,13 @@ func (ne *NormalizedEvent) Validate() error {
 // reaches the LLM context pipeline.
 func (ne *NormalizedEvent) IsErrorLevel() bool {
 	return ne.Severity.AtLeast(SeverityError)
+}
+
+// GenerateEventID constructs a deterministic or fallback unique event identifier
+// from the stream ID and monotonically increasing sequence number.
+func GenerateEventID(streamID string, seqNo uint64) string {
+	if streamID != "" {
+		return fmt.Sprintf("%s-%d", streamID, seqNo)
+	}
+	return fmt.Sprintf("evt-%d", seqNo)
 }
